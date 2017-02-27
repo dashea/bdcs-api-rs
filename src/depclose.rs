@@ -150,6 +150,34 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
     }
 }
 
+// The expression for a package and its dependencies is:
+// PACKAGE_group_id AND (PACKAGE_provides_1 AND PACKAGE_provides_2 AND ...) AND
+//                      (PACKAGE_requires_1 AND PACKAGE_requires_2 AND ...) AND
+//                      (NOT PACKAGE_obsoletes_1 AND NOT PACKAGE_obsoletes_2 AND ...) AND
+//                      (NOT PACKAGE_conflicts_1 AND NOT PACKAGE_conflicts_2 AND ...)
+//
+// for each requires, this expands to a list of packages that provide the given requires expression
+//   PACKAGE_requires_1 AND (PACKAGE_requires_1_provided_by_1 OR PACKAGES_requires_1_provided_by_2 OR ...)
+//
+// Each of the requires_provided_by atoms is a group id with a provides that satisfies the
+// given requires. For each of these group ids, if the group has already been closed over in a
+// parent of this expression, it's done. This check needs to be only on the parents, since the
+// group id could exist in another branch of an OR. The child requirements for the group need to be
+// in both branches, in case one of them gets eliminated during the solving step.
+//
+// Otherwise, recurse on the group and the requires_provided_by_atom expands to:
+//
+//    PACKAGE_requires_1_provided_by_1 AND (required_package_provides_1 AND required_package_provides_2 AND ...) ...
+//
+// Obsoletes and conflicts do not need to be further expanded. Any conflicting packages that
+// were closed over will be eliminated (or determined to be unresolvable) during depsolve.
+//
+// The end result is a boolean expression containing a mix of Requirements and group ids. The final
+// result of depsolving will be a list of group ids. Each of the group id atoms is AND'd with its
+// requirements so that during unit propagation a group id can only be removed from the expression
+// if everything it needs can be removed from the expression, so that a group id is effectively the
+// thing that can be turned on or off during solving.
+
 fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, parent_groups: &HashSet<i64>, cache: &mut HashMap<i64, DepExpression>) -> Result<DepExpression, String> {
     println!("depclose_package: {}", group_id);
 
