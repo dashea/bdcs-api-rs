@@ -56,6 +56,7 @@ impl fmt::Display for DepAtom {
 }
 
 // TODO rename once this is all sorted out
+#[derive(Debug, Clone)]
 pub enum DepExpression {
     Atom(DepAtom),
     And(Box<Vec<DepExpression>>),
@@ -79,7 +80,7 @@ impl fmt::Display for DepExpression {
 }
 
 // Given a requirement, find a list of groups providing it and return all of that as an expression
-fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, parents: &HashSet<i64>) -> Result<DepExpression, String> {
+fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, parents: &HashSet<i64>, cache: &mut HashMap<i64, DepExpression>) -> Result<DepExpression, String> {
     println!("req_providers: {} {}", req, parents.len());
     // helper function for converting a (Group, KeyVal) to Option<(group_id, Requirement)>
     fn provider_to_requirement(group: &Groups, kv: &KeyVal) -> Option<(i64, Requirement)> {
@@ -97,13 +98,14 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
     }
 
     // gather child requirements if necessary
-    fn depclose_provider(conn: &Connection, arches: &Vec<String>, group_id: i64, parents: &HashSet<i64>) -> Result<DepExpression, String> {
+    fn depclose_provider(conn: &Connection, arches: &Vec<String>, group_id: i64, parents: &HashSet<i64>, cache: &mut HashMap<i64, DepExpression>) -> Result<DepExpression, String> {
         let group_id_expr = DepExpression::Atom(DepAtom::GroupId(group_id));
         if parents.contains(&group_id) {
             println!("already closed over {}, skipping", group_id);
             Ok(group_id_expr)
         } else {
-            let provider_expr = try!(depclose_package(conn, arches, group_id, parents));
+            let provider_expr = try!(depclose_package(conn, arches, group_id, parents, cache));
+            cache.insert(group_id, provider_expr.clone());
             Ok(DepExpression::And(Box::new(vec![group_id_expr, provider_expr])))
         }
     }
@@ -120,7 +122,7 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
                                              .filter(|&(ref group_id, ref provider_req)| provider_req.satisfies(&req))
                                              // map the remaining providers to an expression, recursing to fetch the provider's requirements
                                              // any recursions that return Err unsatisfiable, so filter those out
-                                             .filter_map(|(group_id, _)| depclose_provider(conn, arches, group_id, parents).ok())
+                                             .filter_map(|(group_id, _)| depclose_provider(conn, arches, group_id, parents, cache).ok())
                                              .collect::<Vec<DepExpression>>();
 
             providers_checked
@@ -133,7 +135,7 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
         let mut file_providers = match get_groups_filename(conn, req.name.as_str()) {
             Ok(groups) => {
                 // Unlike group_providers, there are no versions to care about here
-                groups.iter().filter_map(|ref group| depclose_provider(conn, arches, group.id, parents).ok()).collect()
+                groups.iter().filter_map(|ref group| depclose_provider(conn, arches, group.id, parents, cache).ok()).collect()
             },
             Err(e) => return Err(e.to_string())
         };
@@ -148,8 +150,14 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
     }
 }
 
-fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, parent_groups: &HashSet<i64>) -> Result<DepExpression, String> {
+fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, parent_groups: &HashSet<i64>, cache: &mut HashMap<i64, DepExpression>) -> Result<DepExpression, String> {
     println!("depclose_package: {}", group_id);
+
+    // If this value is cached, return it
+    if let Some(ref expr) = cache.get(&group_id) {
+        return Ok((*expr).clone());
+    }
+
     // TODO a functional hashmap or something similar would be super handy here
     // add this group to the parent groups, so that a cycle doesn't try to recurse on this group again
     let mut parent_groups_copy = parent_groups.clone();
@@ -203,7 +211,7 @@ fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, pare
             // for each requirement, create a an expression of (requirement AND requirement_providers)
             let requirements_result: Result<Vec<DepExpression>, String> =
                 gr_reqs.iter().map(|r| {
-                    let providers = try!(req_providers(conn, arches, r, &parent_groups_copy));
+                    let providers = try!(req_providers(conn, arches, r, &parent_groups_copy, cache));
                     let req_expr  = DepExpression::Atom(DepAtom::Requirement(r.clone()));
                     Ok(DepExpression::And(Box::new(vec![req_expr, providers])))
                 }).collect();
@@ -226,7 +234,7 @@ pub fn close_dependencies(conn: &Connection, arches: &Vec<String>, packages: &Ve
     for p in packages.iter() {
         // TODO process all groups?
         match get_groups_name(conn, p, 0, 1) {
-            Ok(groups) => req_list.push(depclose_package(conn, arches, groups[0].id, &HashSet::new())?),
+            Ok(groups) => req_list.push(depclose_package(conn, arches, groups[0].id, &HashSet::new(), &mut HashMap::new())?),
             Err(e)     => return Err(e.to_string())
         }
     }
