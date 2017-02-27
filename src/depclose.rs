@@ -20,7 +20,9 @@ use rpm::*;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::slice::Iter;
 use std::str::FromStr;
+use itertools::Itertools;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Proposition {
@@ -37,173 +39,197 @@ impl fmt::Display for Proposition {
     }
 }
 
-fn get_requirement_group_id(conn: &Connection, arches: &Vec<String>, id: i64) -> Option<Requirement> {
-    let kvs = get_groups_kv_group_id(conn, id);
+// TODO might need to mess with the type for depsolve
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum DepAtom {
+    GroupId(i64),
+    Requirement(Requirement)
+}
 
-    let mut name = String::from("");
-    let mut epoch = None;
-    let mut ver = String::from("");
-    let mut rel = String::from("");
-    let mut arch = String::from("");
-
-    for row in kvs.unwrap() {
-        match row.key_value.as_ref() {
-            "name"      => name = row.val_value,
-            "epoch"     => epoch = Some(row.val_value),
-            "version"   => ver = row.val_value,
-            "release"   => rel = row.val_value,
-            "arch"      => arch = row.val_value,
-            _           => continue,
+impl fmt::Display for DepAtom {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            &DepAtom::GroupId(i)            => write!(f, "groupid={}", i),
+            &DepAtom::Requirement(ref r)    => write!(f, "({})", r)
         }
-    }
-
-    if arch != "noarch" && !arches.contains(&arch) {
-        return None;
-    }
-
-    match epoch {
-        Some(e) => Some(Requirement::from_str(format!("{}:{}-{}-{}.{}", e, name, ver, rel, arch).as_str()).unwrap()),
-        None    => Some(Requirement::from_str(format!("{}-{}-{}.{}", name, ver, rel, arch).as_str()).unwrap())
     }
 }
 
-fn find_provider_for_name(conn: &Connection, arches: &Vec<String>, thing: &str) -> Result<Vec<(i64, (Requirement, Requirement))>, String> {
-    let mut contents = Vec::new();
+// TODO rename once this is all sorted out
+pub enum DepExpression {
+    Atom(DepAtom),
+    And(Box<Vec<DepExpression>>),
+    Or(Box<Vec<DepExpression>>),
+    Not(Box<DepExpression>)
+}
 
-    match get_provider_groups(conn, thing) {
-        Ok(providers)   => { for tup in providers {
-                                 if let Some(nevra) = get_requirement_group_id(conn, arches, tup.0.id) {
-                                     match tup.1.ext_value {
-                                         Some(expr) => contents.push((tup.0.id, (nevra, Requirement::from_str(expr.as_str()).unwrap()))),
-                                         None       => contents.push((tup.0.id, (nevra, Requirement::from_str(thing).unwrap()))),
-                                     }
-                                 }
-                             }
-
-                             Ok(contents)
-                           }
-    
-        Err(e)          => { Err(e.to_string()) }
+impl fmt::Display for DepExpression {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            &DepExpression::Atom(ref req)    => write!(f, "{}", req),
+            &DepExpression::And(ref lst)     => { let strs: String = lst.iter().map(|x| x.to_string()).intersperse(String::from(" AND ")).collect();
+                                                 write!(f, "{}", strs)
+                                               },
+            &DepExpression::Or(ref lst)      => { let strs: String = lst.iter().map(|x| x.to_string()).intersperse(String::from(" OR ")).collect();
+                                                 write!(f, "{}", strs)
+                                               },
+            &DepExpression::Not(ref expr)    => write!(f, "NOT {}", expr)
+        }
     }
 }
 
-fn find_group_containing_file(conn: &Connection, arches: &Vec<String>, thing: &str) -> Result<Vec<(i64, (Requirement, Requirement))>, String> {
-    let mut contents = Vec::new();
+// Given a requirement, find a list of groups providing it and return all of that as an expression
+fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, parents: &HashSet<i64>) -> Result<DepExpression, String> {
+    println!("req_providers: {} {}", req, parents.len());
+    // helper function for converting a (Group, KeyVal) to Option<(group_id, Requirement)>
+    fn provider_to_requirement(group: &Groups, kv: &KeyVal) -> Option<(i64, Requirement)> {
+        let ext_val = match &kv.ext_value {
+            &Some(ref ext_val) => ext_val,
+            &None => return None
+        };
 
-    match get_groups_filename(conn, thing) {
-        Ok(providers)   => { for tup in providers {
-                                 if let Some(nevra) = get_requirement_group_id(conn, arches, tup.id) {
-                                     contents.push((tup.id, (nevra, Requirement::from_str(thing).unwrap())));
-                                 }
-                             }
+        let requirement = match Requirement::from_str(ext_val.as_str()) {
+            Ok(req) => req,
+            Err(_)  => return None
+        };
 
-                             Ok(contents)
-                           }
-        Err(e)          => { Err(e.to_string()) }
+        Some((group.id, requirement))
+    }
+
+    // gather child requirements if necessary
+    fn depclose_provider(conn: &Connection, arches: &Vec<String>, group_id: i64, parents: &HashSet<i64>) -> Result<DepExpression, String> {
+        let group_id_expr = DepExpression::Atom(DepAtom::GroupId(group_id));
+        if parents.contains(&group_id) {
+            println!("already closed over {}, skipping", group_id);
+            Ok(group_id_expr)
+        } else {
+            let provider_expr = try!(depclose_package(conn, arches, group_id, parents));
+            Ok(DepExpression::And(Box::new(vec![group_id_expr, provider_expr])))
+        }
+    }
+
+    let mut group_providers = match get_provider_groups(conn, req.name.as_str()) {
+        Ok(providers) => {
+            // We have a vector of (Groups, KeyVal) pairs, not all of which match the
+            // version portion of the requirement expression. We want the matching
+            // providers as DepExpression values, with any unsolvable providers removed
+            let providers_checked = providers.iter()
+                                             // convert the provides expression to a Requirement and return a (group_id, Requirement) tuple
+                                             .filter_map(|&(ref group, ref kv)| provider_to_requirement(group, kv))
+                                             // filter out any that don't match version-wise
+                                             .filter(|&(ref group_id, ref provider_req)| provider_req.satisfies(&req))
+                                             // map the remaining providers to an expression, recursing to fetch the provider's requirements
+                                             // any recursions that return Err unsatisfiable, so filter those out
+                                             .filter_map(|(group_id, _)| depclose_provider(conn, arches, group_id, parents).ok())
+                                             .collect::<Vec<DepExpression>>();
+
+            providers_checked
+        },
+        Err(e) => return Err(e.to_string())
+    };
+
+    // If the requirement looks like a filename, check for groups providing the file *in addition to* rpm-provide
+    if req.name.starts_with('/') {
+        let mut file_providers = match get_groups_filename(conn, req.name.as_str()) {
+            Ok(groups) => {
+                // Unlike group_providers, there are no versions to care about here
+                groups.iter().filter_map(|ref group| depclose_provider(conn, arches, group.id, parents).ok()).collect()
+            },
+            Err(e) => return Err(e.to_string())
+        };
+        group_providers.append(&mut file_providers);
+    }
+
+    // If there are no providers for the requirement, the requirement is unsatisfied, and that's an error
+    if group_providers.is_empty() {
+        Err(format!("Unable to satisfy requirement {}", req))
+    } else {
+        Ok(DepExpression::Or(Box::new(group_providers)))
     }
 }
 
-fn what_obsoletes(conn: &Connection, id: i64) -> Result<Vec<(Requirement, Requirement)>, String> {
-    let mut contents = Vec::new();
+fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, parent_groups: &HashSet<i64>) -> Result<DepExpression, String> {
+    println!("depclose_package: {}", group_id);
+    // TODO a functional hashmap or something similar would be super handy here
+    // add this group to the parent groups, so that a cycle doesn't try to recurse on this group again
+    let mut parent_groups_copy = parent_groups.clone();
+    parent_groups_copy.insert(group_id);
 
-    match get_group_obsoletes(conn, id) {
-        Ok(obsoleters)  => { for tup in obsoleters {
-                                 let name = tup.0.name.as_str();
-                                 let expr = tup.1.ext_value.unwrap();
-
-                                 contents.push((Requirement::from_str(name).unwrap(),
-                                                Requirement::from_str(expr.as_str()).unwrap()));
-                             }
-
-                             Ok(contents)
-                           }
-        Err(e)          => { Err(e.to_string()) }
-    }
-}
-
-pub fn close_dependencies(conn: &Connection, arches: &Vec<String>, packages: &Vec<String>) -> Result<(Vec<Proposition>, HashMap<String, Vec<Requirement>>), String> {
-    let mut props = HashSet::new();
-    let mut provided_by_dict: HashMap<String, Vec<Requirement>> = HashMap::new();
-    let mut seen = HashSet::new();
-    let mut worklist = packages.clone();
-
-    while !worklist.is_empty() {
-        let hd = worklist.pop().unwrap();
-
-        // We've seen this before, don't gather it up again.
-        if seen.contains(&hd) {
-            continue;
-        }
-
-        let mut providers = try!(find_provider_for_name(conn, arches, hd.as_str()));
-
-        // If the requirement looks like a filename, also look for packages
-        // providing the file.
-        if hd.starts_with('/') {
-            let mut file_providers = try!(find_group_containing_file(conn, arches, hd.as_str()));
-            providers.append(&mut file_providers);
-        }
-
-        // If we get here and nothing provides hd, that's an error - some package is asking
-        // for something that does not exist.  We can't just have find_provider_for_name and
-        // find_group_containing_file return an Err if a requirement is missing.  Consider
-        // "Requires: /bin/sh".  This looks like a file, but it no longer exists.  It is however
-        // provided by a package.  Thus we need to look in both spots for it.
-        if providers.is_empty() {
-            return Err(format!("Nothing provides {} for architecture {:?}", hd.as_str(), arches));
-        }
-
-        // Extract the group IDs from each provider tuple.
-        let group_ids: Vec<i64> = providers.iter().map(|x| x.0).collect();
-
-        // Add all the new providers to the mapping.  This is keyed on the thing being
-        // provided, and multiple packages can provide the same thing, hence this is a
-        // little more complicated than it should be.
-        for (_, (provided_by, whats_provided)) in providers {
-            provided_by_dict.entry(whats_provided.name).or_insert(vec![]).push(provided_by);
-        }
-
-        // Get the requirements and obsoletes for each.
-        let mut reqs = Vec::new();
-        let mut obs = Vec::new();
-
-        for i in &group_ids {
-            match get_requirements_group_id(conn, *i) {
-                Ok(lst) => { let new = lst.into_iter().map(|x| x.req_expr).collect();
-                             reqs.push(new);
-                           }
-                Err(_)  => { reqs.push(Vec::new()); }
-            }
-
-            let mut lst = try!(what_obsoletes(conn, *i));
-            obs.append(&mut lst);
-        }
-
-        // Add the new propositions to the set.
-        for i in &obs {
-            props.insert(Proposition::Obsoletes(i.0.clone(), i.1.clone()));
-        }
-
-        for (p, reqs_for_p) in group_ids.iter().zip(&reqs) {
-            for i in reqs_for_p {
-                if let Some(nevra) = get_requirement_group_id(conn, arches, *p) {
-                    props.insert(Proposition::Requires (nevra, Requirement::from_str(i).unwrap()));
+    // Get all of the key/val based data we need
+    let (group_provides, group_obsoletes, group_conflicts) = match get_groups_kv_group_id(conn, group_id) {
+        Ok(group_key_vals) => {
+            // map a key/value pair into a Requirement
+            fn kv_to_expr(kv: &KeyVal) -> Result<DepExpression, String> {
+                match &kv.ext_value {
+                    &Some(ref ext_value) => Ok(DepExpression::Atom(DepAtom::Requirement(try!(Requirement::from_str(ext_value.as_str()))))),
+                    &None                => Err(String::from("ext_value is not set"))
                 }
             }
+
+            fn kv_to_not_expr(kv: &KeyVal) -> Result<DepExpression, String> {
+                Ok(DepExpression::Not(Box::new(kv_to_expr(kv)?)))
+            }
+
+            let mut group_provides = Vec::new();
+            let mut group_obsoletes = Vec::new();
+            let mut group_conflicts = Vec::new();
+
+            for kv in group_key_vals.iter() {
+                match kv.key_value.as_str() {
+                    "rpm-provide" => group_provides.push(kv_to_expr(kv)),
+                    "rpm-obsolete" => group_obsoletes.push(kv_to_not_expr(kv)),
+                    "rpm-conflict" => group_conflicts.push(kv_to_not_expr(kv)),
+                    _ => {}
+                }
+            }
+
+            // Collect the Vec<Result<Expression, String>>s into a Result<Vec<Expression>, String>
+            let group_provides_result: Result<Vec<DepExpression>, String> = group_provides.into_iter().collect();
+            let group_obsoletes_result: Result<Vec<DepExpression>, String> = group_obsoletes.into_iter().collect();
+            let group_conflicts_result: Result<Vec<DepExpression>, String> = group_conflicts.into_iter().collect();
+
+            // unwrap the result or return the error
+            (group_provides_result?, group_obsoletes_result?, group_conflicts_result?)
+        },
+        Err(e) => return Err(e.to_string())
+    };
+
+    // Collect the requirements
+    let group_requirements = match get_requirements_group_id(conn, group_id) {
+        Ok(requirements) => {
+            // Map the data from the Requirements table into a rpm Requirement
+            let gr_reqs: Vec<Requirement> = try!(requirements.iter().map(|r| Requirement::from_str(r.req_expr.as_str())).collect());
+
+            // for each requirement, create a an expression of (requirement AND requirement_providers)
+            let requirements_result: Result<Vec<DepExpression>, String> =
+                gr_reqs.iter().map(|r| {
+                    let providers = try!(req_providers(conn, arches, r, &parent_groups_copy));
+                    let req_expr  = DepExpression::Atom(DepAtom::Requirement(r.clone()));
+                    Ok(DepExpression::And(Box::new(vec![req_expr, providers])))
+                }).collect();
+
+            try!(requirements_result)
+        },
+        Err(e) => return Err(e.to_string())
+    };
+
+    Ok(DepExpression::And(Box::new(vec![DepExpression::Atom(DepAtom::GroupId(group_id)),
+                                        DepExpression::And(Box::new(group_provides)),
+                                        DepExpression::And(Box::new(group_requirements)),
+                                        DepExpression::And(Box::new(group_obsoletes)),
+                                        DepExpression::And(Box::new(group_conflicts))])))
+}
+
+pub fn close_dependencies(conn: &Connection, arches: &Vec<String>, packages: &Vec<String>) -> Result<DepExpression, String> {
+    let mut req_list = Vec::new();
+
+    for p in packages.iter() {
+        // TODO process all groups?
+        match get_groups_name(conn, p, 0, 1) {
+            Ok(groups) => req_list.push(depclose_package(conn, arches, groups[0].id, &HashSet::new())?),
+            Err(e)     => return Err(e.to_string())
         }
-
-        // Add the thing we just processed to the seen list so we don't look at it again.
-        seen.insert(hd);
-
-        // And then add all the requirements and obsoletes we just discovered to the
-        // worklist and loop.  Remember reqs is a vector of vectors, so it has to be
-        // flattened.
-        let mut flattened : Vec<String> = reqs.into_iter().flat_map(|x| x.into_iter()).collect();
-        worklist.append(&mut flattened);
-
-        let mut obsolete_names = obs.into_iter().map(|x| x.0.name).collect();
-        worklist.append(&mut obsolete_names);
     }
 
-    Ok((props.into_iter().collect(), provided_by_dict))
+    Ok(DepExpression::Or(Box::new(req_list)))
 }

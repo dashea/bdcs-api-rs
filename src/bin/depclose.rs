@@ -29,33 +29,41 @@ fn main() {
 
     let conn = pool.get().unwrap();
 
-    let (props, provided_by_dict) = match close_dependencies(&conn, &vec!(String::from("x86_64")), &argv) {
-        Err(e)  => { println!("Error: {}", e);
-                     exit(1);
-                   }
-        Ok(tup) => tup
+    let depexpr = match close_dependencies(&conn, &vec!(String::from("x86_64")), &argv) {
+        Err(e)    => { println!("Error: {}", e);
+                       exit(1);
+                     }
+        Ok(expr)  => expr
     };
+    println!("Deps: {}", depexpr);
 
-    let mut exprset = HashSet::new();
+//    let (props, provided_by_dict) = match close_dependencies(&conn, &vec!(String::from("x86_64")), &argv) {
+//        Err(e)  => { println!("Error: {}", e);
+//                     exit(1);
+//                   }
+//        Ok(tup) => tup
+//    };
 
-    // Add boolean expressions for each thing that was requested to be installed.
-    for thing in argv {
-        exprset.insert(Expression::Atom(Requirement::from_str(thing.as_str()).unwrap()));
-    }
-
-    // Convert all the Propositions given by close_dependencies into boolean expressions
-    // that can be solved.  This also involves translating Provides into what actually
-    // provides them.
-    for p in props {
-        if let Some(x) = proposition_to_expression(p, &provided_by_dict) {
-            exprset.insert(x);
-        }
-    }
-
-    let mut assignments = HashMap::new();
-    let mut exprs = exprset.into_iter().collect();
-    unit_propagation(&mut exprs, &mut assignments);
-
-    for a in assignments { println!("{:?}", a) }
-    for x in exprs { println!("{}", x) }
+//     let mut exprset = HashSet::new();
+// 
+//     // Add boolean expressions for each thing that was requested to be installed.
+//     for thing in argv {
+//         exprset.insert(Expression::Atom(Requirement::from_str(thing.as_str()).unwrap()));
+//     }
+// 
+//     // Convert all the Propositions given by close_dependencies into boolean expressions
+//     // that can be solved.  This also involves translating Provides into what actually
+//     // provides them.
+//     for p in props {
+//         if let Some(x) = proposition_to_expression(p, &provided_by_dict) {
+//             exprset.insert(x);
+//         }
+//     }
+// 
+//     let mut assignments = HashMap::new();
+//     let mut exprs = exprset.into_iter().collect();
+//     unit_propagation(&mut exprs, &mut assignments);
+// 
+//     for a in assignments { println!("{:?}", a) }
+//     for x in exprs { println!("{}", x) }
 }
