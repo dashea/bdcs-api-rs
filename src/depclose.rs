@@ -81,7 +81,6 @@ impl fmt::Display for DepExpression {
 
 // Given a requirement, find a list of groups providing it and return all of that as an expression
 fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, parents: &HashSet<i64>, cache: &mut HashMap<i64, DepExpression>) -> Result<DepExpression, String> {
-    println!("req_providers: {} {}", req, parents.len());
     // helper function for converting a (Group, KeyVal) to Option<(group_id, Requirement)>
     fn provider_to_requirement(group: &Groups, kv: &KeyVal) -> Option<(i64, Requirement)> {
         let ext_val = match &kv.ext_value {
@@ -101,7 +100,6 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
     fn depclose_provider(conn: &Connection, arches: &Vec<String>, group_id: i64, parents: &HashSet<i64>, cache: &mut HashMap<i64, DepExpression>) -> Result<DepExpression, String> {
         let group_id_expr = DepExpression::Atom(DepAtom::GroupId(group_id));
         if parents.contains(&group_id) {
-            println!("already closed over {}, skipping", group_id);
             Ok(group_id_expr)
         } else {
             let provider_expr = try!(depclose_package(conn, arches, group_id, parents, cache));
@@ -179,8 +177,6 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
 // thing that can be turned on or off during solving.
 
 fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, parent_groups: &HashSet<i64>, cache: &mut HashMap<i64, DepExpression>) -> Result<DepExpression, String> {
-    println!("depclose_package: {}", group_id);
-
     // If this value is cached, return it
     if let Some(ref expr) = cache.get(&group_id) {
         return Ok((*expr).clone());
@@ -192,6 +188,8 @@ fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, pare
     parent_groups_copy.insert(group_id);
 
     // Get all of the key/val based data we need
+    // TODO would be nice to have a function or change this one to specify a key or keys, so we're not
+    // getting all key/val data
     let (group_provides, group_obsoletes, group_conflicts) = match get_groups_kv_group_id(conn, group_id) {
         Ok(group_key_vals) => {
             // map a key/value pair into a Requirement
@@ -249,11 +247,25 @@ fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, pare
         Err(e) => return Err(e.to_string())
     };
 
-    Ok(DepExpression::And(Box::new(vec![DepExpression::Atom(DepAtom::GroupId(group_id)),
-                                        DepExpression::And(Box::new(group_provides)),
-                                        DepExpression::And(Box::new(group_requirements)),
-                                        DepExpression::And(Box::new(group_obsoletes)),
-                                        DepExpression::And(Box::new(group_conflicts))])))
+    let mut and_list = Vec::new();
+    and_list.push(DepExpression::Atom(DepAtom::GroupId(group_id)));
+    if !group_provides.is_empty() {
+        and_list.push(DepExpression::And(Box::new(group_provides)));
+    }
+
+    if !group_requirements.is_empty() {
+        and_list.push(DepExpression::And(Box::new(group_requirements)));
+    }
+
+    if !group_obsoletes.is_empty() {
+        and_list.push(DepExpression::And(Box::new(group_obsoletes)));
+    }
+
+    if !group_conflicts.is_empty() {
+        and_list.push(DepExpression::And(Box::new(group_conflicts)));
+    }
+
+    Ok(DepExpression::And(Box::new(and_list)))
 }
 
 pub fn close_dependencies(conn: &Connection, arches: &Vec<String>, packages: &Vec<String>) -> Result<DepExpression, String> {
