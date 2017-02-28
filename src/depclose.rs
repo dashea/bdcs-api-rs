@@ -80,7 +80,7 @@ impl fmt::Display for DepExpression {
 }
 
 // Given a requirement, find a list of groups providing it and return all of that as an expression
-fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, parents: &HashSet<i64>, cache: &mut HashMap<i64, DepExpression>) -> Result<DepExpression, String> {
+fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, parents: &HashSet<i64>, cache: &mut HashMap<i64, DepExpression>) -> Result<Option<DepExpression>, String> {
     // helper function for converting a (Group, KeyVal) to Option<(group_id, Requirement)>
     fn provider_to_requirement(group: &Groups, kv: &KeyVal) -> Option<(i64, Requirement)> {
         let ext_val = match &kv.ext_value {
@@ -97,16 +97,20 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
     }
 
     // gather child requirements if necessary
-    fn depclose_provider(conn: &Connection, arches: &Vec<String>, group_id: i64, parents: &HashSet<i64>, cache: &mut HashMap<i64, DepExpression>) -> Result<DepExpression, String> {
-        let group_id_expr = DepExpression::Atom(DepAtom::GroupId(group_id));
+    fn depclose_provider(conn: &Connection, arches: &Vec<String>, group_id: i64, parents: &HashSet<i64>, cache: &mut HashMap<i64, DepExpression>) -> Result<Option<DepExpression>, String> {
         if parents.contains(&group_id) {
-            Ok(group_id_expr)
+            // This requirement is already satisfied, return
+            Ok(None)
         } else {
             let provider_expr = try!(depclose_package(conn, arches, group_id, parents, cache));
             cache.insert(group_id, provider_expr.clone());
-            Ok(DepExpression::And(Box::new(vec![group_id_expr, provider_expr])))
+            Ok(Some(provider_expr))
         }
     }
+
+    // flag to indicate that the requirement is satisfied via a parent of this expression, even if
+    // the requirement list comes out empty
+    let mut satisfied = false;
 
     let mut group_providers = match get_provider_groups(conn, req.name.as_str()) {
         Ok(providers) => {
@@ -120,7 +124,14 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
                                              .filter(|&(ref group_id, ref provider_req)| provider_req.satisfies(&req))
                                              // map the remaining providers to an expression, recursing to fetch the provider's requirements
                                              // any recursions that return Err unsatisfiable, so filter those out
-                                             .filter_map(|(group_id, _)| depclose_provider(conn, arches, group_id, parents, cache).ok())
+                                             .filter_map(|(group_id, _)| match depclose_provider(conn, arches, group_id, parents, cache) {
+                                                 Ok(provider) => {
+                                                     // mark the requirement as satisfied
+                                                     satisfied = true;
+                                                     provider
+                                                 },
+                                                 Err(e) => None
+                                             })
                                              .collect::<Vec<DepExpression>>();
 
             providers_checked
@@ -133,18 +144,31 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
         let mut file_providers = match get_groups_filename(conn, req.name.as_str()) {
             Ok(groups) => {
                 // Unlike group_providers, there are no versions to care about here
-                groups.iter().filter_map(|ref group| depclose_provider(conn, arches, group.id, parents, cache).ok()).collect()
+                groups.iter().filter_map(|ref group| match depclose_provider(conn, arches, group.id, parents, cache) {
+                    Ok(provider) => {
+                        satisfied = true;
+                        provider
+                    },
+                    Err(e) => None
+                }).collect()
             },
             Err(e) => return Err(e.to_string())
         };
         group_providers.append(&mut file_providers);
     }
 
-    // If there are no providers for the requirement, the requirement is unsatisfied, and that's an error
-    if group_providers.is_empty() {
+    if group_providers.is_empty() && !satisfied {
+        // If there are no providers for the requirement, the requirement is unsatisfied, and that's an error
         Err(format!("Unable to satisfy requirement {}", req))
+    } else if group_providers.is_empty() {
+        // Requirement satisfied through a parent, but nothing new to add
+        Ok(None)
+    } else if group_providers.len() == 1 {
+        // Only one provider, return it
+        Ok(Some(group_providers[0].clone()))
     } else {
-        Ok(DepExpression::Or(Box::new(group_providers)))
+        // a choice among more than one provider
+        Ok(Some(DepExpression::Or(Box::new(group_providers))))
     }
 }
 
@@ -234,15 +258,34 @@ fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, pare
             // Map the data from the Requirements table into a rpm Requirement
             let gr_reqs: Vec<Requirement> = try!(requirements.iter().map(|r| Requirement::from_str(r.req_expr.as_str())).collect());
 
-            // for each requirement, create a an expression of (requirement AND requirement_providers)
-            let requirements_result: Result<Vec<DepExpression>, String> =
-                gr_reqs.iter().map(|r| {
-                    let providers = try!(req_providers(conn, arches, r, &parent_groups_copy, cache));
-                    let req_expr  = DepExpression::Atom(DepAtom::Requirement(r.clone()));
-                    Ok(DepExpression::And(Box::new(vec![req_expr, providers])))
-                }).collect();
-
-            try!(requirements_result)
+            // for each requirement, create an expression of (requirement AND requirement_providers)
+            let mut group_requirements: Vec<DepExpression> = Vec::new();
+            for r in gr_reqs.iter() {
+                // If only one group comes back as the requirement (i.e., there is only one
+                // provider for the requirement), that group can be skipped in additional
+                // requirements.
+                // For instance, if our expression so far is something like:
+                //    (req_1 AND (groupid=47 AND group_47_reqs)) AND (req_2 ...)
+                // 
+                // and req_2 is also satisified by groupid=47, we don't need another copy of
+                // groupid=47 and its requirements.
+                //
+                // This isn't perfect, since there can still be extra copies depending on the order
+                // things are processed in, but it should cut way down on extra copies of
+                // everything.
+                let providers = try!(req_providers(conn, arches, r, &parent_groups_copy, cache));
+                let req_expr  = DepExpression::Atom(DepAtom::Requirement(r.clone()));
+                match providers {
+                    Some(provider_exp) => {
+                        if let DepExpression::Atom(DepAtom::GroupId(group_id)) = provider_exp {
+                            parent_groups_copy.insert(group_id);
+                        }
+                        group_requirements.push(DepExpression::And(Box::new(vec![req_expr, provider_exp])));
+                    },
+                    None => ()
+                };
+            }
+            group_requirements
         },
         Err(e) => return Err(e.to_string())
     };
