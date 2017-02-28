@@ -203,7 +203,7 @@ fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, pare
             }
 
             fn kv_to_not_expr(kv: &KeyVal) -> Result<DepExpression, String> {
-                Ok(DepExpression::Not(Box::new(kv_to_expr(kv)?)))
+                Ok(DepExpression::Not(Box::new(try!(kv_to_expr(kv)))))
             }
 
             let mut group_provides = Vec::new();
@@ -225,7 +225,7 @@ fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, pare
             let group_conflicts_result: Result<Vec<DepExpression>, String> = group_conflicts.into_iter().collect();
 
             // unwrap the result or return the error
-            (group_provides_result?, group_obsoletes_result?, group_conflicts_result?)
+            (try!(group_provides_result), try!(group_obsoletes_result), try!(group_conflicts_result))
         },
         Err(e) => return Err(e.to_string())
     };
@@ -258,11 +258,14 @@ fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, pare
 
 pub fn close_dependencies(conn: &Connection, arches: &Vec<String>, packages: &Vec<String>) -> Result<DepExpression, String> {
     let mut req_list = Vec::new();
+    let mut cache = HashMap::new();
 
     for p in packages.iter() {
         // TODO process all groups?
         match get_groups_name(conn, p, 0, 1) {
-            Ok(groups) => req_list.push(depclose_package(conn, arches, groups[0].id, &HashSet::new(), &mut HashMap::new())?),
+            Ok(groups) => req_list.push(
+                try!(depclose_package(conn, arches, groups[0].id, &HashSet::new(), &mut cache))
+            ),
             Err(e)     => return Err(e.to_string())
         }
     }
