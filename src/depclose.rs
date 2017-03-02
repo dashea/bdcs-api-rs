@@ -24,21 +24,7 @@ use std::slice::Iter;
 use std::str::FromStr;
 use itertools::Itertools;
 use std::rc::Rc;
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum Proposition {
-    Obsoletes(Requirement, Requirement),
-    Requires(Requirement, Requirement),
-}
-
-impl fmt::Display for Proposition {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Proposition::Obsoletes(ref left, ref right) => write!(f, "{} OBSOLETES {}", left, right),
-            Proposition::Requires(ref left, ref right)  => write!(f, "{} REQUIRES {}", left, right)
-        }
-    }
-}
+use std::cell::RefCell;
 
 // TODO might need to mess with the type for depsolve
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -60,28 +46,28 @@ impl fmt::Display for DepAtom {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DepExpression {
     Atom(DepAtom),
-    And(Vec<Rc<DepExpression>>),
-    Or(Vec<Rc<DepExpression>>),
-    Not(Rc<DepExpression>)
+    And(Vec<Rc<RefCell<DepExpression>>>),
+    Or(Vec<Rc<RefCell<DepExpression>>>),
+    Not(Rc<RefCell<DepExpression>>)
 }
 
 impl fmt::Display for DepExpression {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             &DepExpression::Atom(ref req)    => write!(f, "{}", req),
-            &DepExpression::And(ref lst)     => { let strs: String = lst.iter().map(|x| x.to_string()).intersperse(String::from(" AND ")).collect();
-                                                 write!(f, "{}", strs)
-                                               },
-            &DepExpression::Or(ref lst)      => { let strs: String = lst.iter().map(|x| x.to_string()).intersperse(String::from(" OR ")).collect();
-                                                 write!(f, "{}", strs)
-                                               },
-            &DepExpression::Not(ref expr)    => write!(f, "NOT {}", expr)
+            &DepExpression::And(ref lst)     => { let strs: String = lst.iter().map(|x| x.borrow().to_string()).intersperse(String::from(" AND ")).collect();
+                                                  write!(f, "{}", strs)
+                                                },
+            &DepExpression::Or(ref lst)      => { let strs: String = lst.iter().map(|x| x.borrow().to_string()).intersperse(String::from(" OR ")).collect();
+                                                  write!(f, "{}", strs)
+                                                },
+            &DepExpression::Not(ref expr)    => write!(f, "NOT {}", *(expr.borrow()))
         }
     }
 }
 
 // Given a requirement, find a list of groups providing it and return all of that as an expression
-fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, parents: &HashSet<i64>, cache: &mut HashMap<i64, Rc<DepExpression>>) -> Result<Option<Rc<DepExpression>>, String> {
+fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, parents: &HashSet<i64>, cache: &mut HashMap<i64, Rc<RefCell<DepExpression>>>) -> Result<Option<Rc<RefCell<DepExpression>>>, String> {
     // helper function for converting a (Group, KeyVal) to Option<(group_id, Requirement)>
     fn provider_to_requirement(group: &Groups, kv: &KeyVal) -> Option<(i64, Requirement)> {
         let ext_val = match &kv.ext_value {
@@ -98,7 +84,7 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
     }
 
     // gather child requirements if necessary
-    fn depclose_provider(conn: &Connection, arches: &Vec<String>, group_id: i64, parents: &HashSet<i64>, cache: &mut HashMap<i64, Rc<DepExpression>>) -> Result<Option<Rc<DepExpression>>, String> {
+    fn depclose_provider(conn: &Connection, arches: &Vec<String>, group_id: i64, parents: &HashSet<i64>, cache: &mut HashMap<i64, Rc<RefCell<DepExpression>>>) -> Result<Option<Rc<RefCell<DepExpression>>>, String> {
         if parents.contains(&group_id) {
             // This requirement is already satisfied, return
             Ok(None)
@@ -133,7 +119,7 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
                                                  },
                                                  Err(e) => None
                                              })
-                                             .collect::<Vec<Rc<DepExpression>>>();
+                                             .collect::<Vec<Rc<RefCell<DepExpression>>>>();
 
             providers_checked
         },
@@ -169,7 +155,7 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
         Ok(Some(group_providers[0].clone()))
     } else {
         // a choice among more than one provider
-        Ok(Some(Rc::new(DepExpression::Or(group_providers))))
+        Ok(Some(Rc::new(RefCell::new(DepExpression::Or(group_providers)))))
     }
 }
 
@@ -201,10 +187,10 @@ fn req_providers(conn: &Connection, arches: &Vec<String>, req: &Requirement, par
 // if everything it needs can be removed from the expression, so that a group id is effectively the
 // thing that can be turned on or off during solving.
 
-fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, parent_groups: &HashSet<i64>, cache: &mut HashMap<i64, Rc<DepExpression>>) -> Result<Rc<DepExpression>, String> {
+fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, parent_groups: &HashSet<i64>, cache: &mut HashMap<i64, Rc<RefCell<DepExpression>>>) -> Result<Rc<RefCell<DepExpression>>, String> {
     // If this value is cached, return it
-    if let Some(ref expr) = cache.get(&group_id) {
-        return Ok((*expr).clone());
+    if let Some(expr) = cache.get(&group_id) {
+        return Ok(expr.clone());
     }
 
     // TODO a functional hashmap or something similar would be super handy here
@@ -218,15 +204,15 @@ fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, pare
     let (group_provides, group_obsoletes, group_conflicts) = match get_groups_kv_group_id(conn, group_id) {
         Ok(group_key_vals) => {
             // map a key/value pair into a Requirement
-            fn kv_to_expr(kv: &KeyVal) -> Result<Rc<DepExpression>, String> {
+            fn kv_to_expr(kv: &KeyVal) -> Result<Rc<RefCell<DepExpression>>, String> {
                 match &kv.ext_value {
-                    &Some(ref ext_value) => Ok(Rc::new(DepExpression::Atom(DepAtom::Requirement(try!(Requirement::from_str(ext_value.as_str())))))),
+                    &Some(ref ext_value) => Ok(Rc::new(RefCell::new(DepExpression::Atom(DepAtom::Requirement(try!(Requirement::from_str(ext_value.as_str()))))))),
                     &None                => Err(String::from("ext_value is not set"))
                 }
             }
 
-            fn kv_to_not_expr(kv: &KeyVal) -> Result<Rc<DepExpression>, String> {
-                Ok(Rc::new(DepExpression::Not(try!(kv_to_expr(kv)))))
+            fn kv_to_not_expr(kv: &KeyVal) -> Result<Rc<RefCell<DepExpression>>, String> {
+                Ok(Rc::new(RefCell::new(DepExpression::Not(try!(kv_to_expr(kv))))))
             }
 
             let mut group_provides = Vec::new();
@@ -243,9 +229,9 @@ fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, pare
             }
 
             // Collect the Vec<Result<Expression, String>>s into a Result<Vec<Expression>, String>
-            let group_provides_result: Result<Vec<Rc<DepExpression>>, String> = group_provides.into_iter().collect();
-            let group_obsoletes_result: Result<Vec<Rc<DepExpression>>, String> = group_obsoletes.into_iter().collect();
-            let group_conflicts_result: Result<Vec<Rc<DepExpression>>, String> = group_conflicts.into_iter().collect();
+            let group_provides_result: Result<Vec<Rc<RefCell<DepExpression>>>, String> = group_provides.into_iter().collect();
+            let group_obsoletes_result: Result<Vec<Rc<RefCell<DepExpression>>>, String> = group_obsoletes.into_iter().collect();
+            let group_conflicts_result: Result<Vec<Rc<RefCell<DepExpression>>>, String> = group_conflicts.into_iter().collect();
 
             // unwrap the result or return the error
             (try!(group_provides_result), try!(group_obsoletes_result), try!(group_conflicts_result))
@@ -260,7 +246,7 @@ fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, pare
             let gr_reqs: Vec<Requirement> = try!(requirements.iter().map(|r| Requirement::from_str(r.req_expr.as_str())).collect());
 
             // for each requirement, create an expression of (requirement AND requirement_providers)
-            let mut group_requirements: Vec<Rc<DepExpression>> = Vec::new();
+            let mut group_requirements: Vec<Rc<RefCell<DepExpression>>> = Vec::new();
             for r in gr_reqs.iter() {
                 // If only one group comes back as the requirement (i.e., there is only one
                 // provider for the requirement), that group can be skipped in additional
@@ -275,13 +261,13 @@ fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, pare
                 // things are processed in, but it should cut way down on extra copies of
                 // everything.
                 let providers = try!(req_providers(conn, arches, r, &parent_groups_copy, cache));
-                let req_expr  = Rc::new(DepExpression::Atom(DepAtom::Requirement(r.clone())));
+                let req_expr  = Rc::new(RefCell::new(DepExpression::Atom(DepAtom::Requirement(r.clone()))));
                 match providers {
                     Some(provider_exp) => {
-                        if Rc::new(DepExpression::Atom(DepAtom::GroupId(group_id))) == provider_exp {
+                        if Rc::new(RefCell::new(DepExpression::Atom(DepAtom::GroupId(group_id)))) == provider_exp {
                             parent_groups_copy.insert(group_id);
                         }
-                        group_requirements.push(Rc::new(DepExpression::And(vec![req_expr, provider_exp])));
+                        group_requirements.push(Rc::new(RefCell::new(DepExpression::And(vec![req_expr, provider_exp]))));
                     },
                     None => ()
                 };
@@ -292,29 +278,24 @@ fn depclose_package(conn: &Connection, arches: &Vec<String>, group_id: i64, pare
     };
 
     let mut and_list = Vec::new();
-    //and_list.push(DepExpression::Atom(DepAtom::Requirement(Requirement::from_str("NEW_PACKAGE")?)));
-    and_list.push(Rc::new(DepExpression::Atom(DepAtom::GroupId(group_id))));
+    and_list.push(Rc::new(RefCell::new(DepExpression::Atom(DepAtom::GroupId(group_id)))));
     if !group_provides.is_empty() {
-        //and_list.push(Rc::new(DepExpression::Atom(DepAtom::Requirement(Requirement::from_str("PROVIDES")?))));
-        and_list.push(Rc::new(DepExpression::And(group_provides)));
+        and_list.push(Rc::new(RefCell::new(DepExpression::And(group_provides))));
     }
 
     if !group_requirements.is_empty() {
-        //and_list.push(Rc::new(DepExpression::Atom(DepAtom::Requirement(Requirement::from_str("REQUIRES")?))));
-        and_list.push(Rc::new(DepExpression::And(group_requirements)));
+        and_list.push(Rc::new(RefCell::new(DepExpression::And(group_requirements))));
     }
 
     if !group_obsoletes.is_empty() {
-        //and_list.push(Rc::new(DepExpression::Atom(DepAtom::Requirement(Requirement::from_str("OBSOLETES")?))));
-        and_list.push(Rc::new(DepExpression::And(group_obsoletes)));
+        and_list.push(Rc::new(RefCell::new(DepExpression::And(group_obsoletes))));
     }
 
     if !group_conflicts.is_empty() {
-        //and_list.push(Rc::new(DepExpression::Atom(DepAtom::Requirement(Requirement::from_str("CONFLICTS")?))));
-        and_list.push(Rc::new(DepExpression::And(group_conflicts)));
+        and_list.push(Rc::new(RefCell::new(DepExpression::And(group_conflicts))));
     }
 
-    Ok(Rc::new(DepExpression::And(and_list)))
+    Ok(Rc::new(RefCell::new(DepExpression::And(and_list))))
 }
 
 pub fn close_dependencies(conn: &Connection, arches: &Vec<String>, packages: &Vec<String>) -> Result<DepExpression, String> {
